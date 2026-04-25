@@ -123,7 +123,14 @@ app.get("/api/titles/:type/:id", async (req: Request, res: Response) => {
 app.get("/api/titles/:type/:id/availability", async (req: Request, res: Response) => {
   try {
     const { type, id } = req.params;
-    const region = (req.query.region as string) || "US";
+    let region = (req.query.region as string) || "US";
+
+    // If authenticated, try to use user's preferred region
+    const auth = getAuth(req);
+    if (auth.userId) {
+      const user = await prisma.user.findUnique({ where: { id: auth.userId } });
+      if (user?.region) region = user.region;
+    }
 
     if (!WATCHMODE_KEY) {
       res.status(500).json({ error: "Watchmode API key not configured" });
@@ -147,11 +154,20 @@ app.get("/api/titles/:type/:id/availability", async (req: Request, res: Response
     const sources = await response.json();
     
     // Clean up results: only show "sub" (subscription) or "free" sources
-    // Remove duplicates (Watchmode sometimes lists SD/HD/4K separately)
     const uniqueSources = new Map();
-    sources.forEach((s: any) => {
+    
+    // Sort sources: prioritize "sub" over "free", and specifically check for "Prime Video"
+    const sortedSources = sources.sort((a: any, b: any) => {
+      if (a.name === "Prime Video") return -1;
+      if (b.name === "Prime Video") return 1;
+      return 0;
+    });
+
+    sortedSources.forEach((s: any) => {
+      // Filter out generic Amazon store links if they are "buy/rent" 
+      // but keep them if they are the only source
       if (["sub", "free"].includes(s.type)) {
-        if (!uniqueSources.has(s.name) || s.type === "sub") {
+        if (!uniqueSources.has(s.name)) {
           uniqueSources.set(s.name, {
             name: s.name,
             type: s.type,
@@ -173,10 +189,30 @@ app.get("/api/me", requireAuth, async (req: Request, res: Response) => {
   try {
     const { userId } = getAuth(req);
     await ensureUser(userId!);
-    res.json({ userId });
+    const user = await prisma.user.findUnique({
+      where: { id: userId! },
+      include: { providers: true }
+    });
+    res.json(user);
   } catch (error) {
     console.error("Sync error:", error);
-    res.status(500).json({ error: "Failed to sync user" });
+    res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+app.patch("/api/me", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { userId } = getAuth(req);
+    const { region } = req.body;
+    await ensureUser(userId!);
+    const user = await prisma.user.update({
+      where: { id: userId! },
+      data: { region }
+    });
+    res.json(user);
+  } catch (error) {
+    console.error("Update error:", error);
+    res.status(500).json({ error: "Failed to update region" });
   }
 });
 
