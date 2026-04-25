@@ -14,6 +14,19 @@ const WATCHMODE_KEY = process.env.WATCHMODE_API_KEY;
 const TMDB_BASE = "https://api.themoviedb.org/3";
 const WATCHMODE_BASE = "https://api.watchmode.com/v1";
 
+const PROVIDER_MAPPING: Record<string, number> = {
+  "Netflix": 203,
+  "Prime Video": 26,
+  "Disney+": 372,
+  "Hulu": 157,
+  "HBO Max": 387,
+  "Apple TV+": 371,
+  "Paramount+": 444,
+  "Peacock": 389,
+  "YouTube TV": 343,
+  "Discovery+": 445
+};
+
 app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:3000" }));
 app.use(express.json());
 app.use(clerkMiddleware());
@@ -76,6 +89,49 @@ app.get("/api/search", async (req: Request, res: Response) => {
   } catch (error) {
     console.error("TMDB search error:", error);
     res.status(500).json({ error: "Search failed" });
+  }
+});
+app.get("/api/titles/recommended", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { userId } = getAuth(req);
+    
+    // 1. Get user's active providers
+    const userProviders = await prisma.provider.findMany({
+      where: { userId: userId!, isActive: true }
+    });
+
+    if (userProviders.length === 0) {
+      return res.json({ results: [] });
+    }
+
+    // 2. Map names to Watchmode IDs
+    const sourceIds = userProviders
+      .map(p => PROVIDER_MAPPING[p.provider])
+      .filter(id => id !== undefined)
+      .join(",");
+
+    if (!sourceIds) return res.json({ results: [] });
+
+    // 3. Fetch from Watchmode List endpoint
+    const response = await fetch(
+      `${WATCHMODE_BASE}/list-titles/?apiKey=${WATCHMODE_KEY}&source_ids=${sourceIds}&types=movie,tv&sort=popularity_desc&limit=20`
+    );
+    const data = await response.json();
+
+    // 4. Map to a clean format (Watchmode results differ from TMDB)
+    const results = data.titles.map((t: any) => ({
+      id: t.tmdb_id,
+      media_type: t.type === "movie" ? "movie" : "tv",
+      title: t.title,
+      poster_path: t.poster_path, // Note: Watchmode provides full URLs often
+      vote_average: 0, // Watchmode list doesn't include rating
+      isRecommended: true
+    }));
+
+    res.json({ results });
+  } catch (error) {
+    console.error("Recommendations error:", error);
+    res.status(500).json({ error: "Failed to fetch recommendations" });
   }
 });
 
