@@ -1,0 +1,42 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id        String   @id // Clerk user ID
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  watchItems WatchlistItem[]
+  providers  Provider[]
+}
+
+model WatchlistItem {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  type      String   // Movie or Series
+  progress  Int      @default(0) // 0-100
+  image     String?
+  provider  String
+  addedAt   DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Provider {
+  id        String   @id @default(cuid())
+  userId    String
+  provider  String   // netflix, prime, hulu, etc.
+  isActive  Boolean  @default(true)
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
+}
