@@ -43,10 +43,24 @@ async function ensureUser(userId: string, email?: string) {
 
 // ─── Watchlist routes ─────────────────────────────────────────────────────────
 
+// GET /api/me — sync Clerk user to DB (call this after sign-in)
+app.get("/api/me", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { userId } = getAuth(req);
+    await ensureUser(userId!);
+    res.json({ userId });
+  } catch (error) {
+    console.error("Sync error:", error);
+    res.status(500).json({ error: "Failed to sync user" });
+  }
+});
+
 // GET /api/watchlist — fetch the signed-in user's watchlist
 app.get("/api/watchlist", requireAuth, async (req: Request, res: Response) => {
   try {
     const { userId } = getAuth(req);
+    // Ensure user exists in DB (lazy sync on first load)
+    await ensureUser(userId!);
     const watchlist = await prisma.watchlistItem.findMany({
       where: { userId: userId! },
       orderBy: { addedAt: "desc" },
