@@ -1,6 +1,8 @@
-import express from "express";
+import "dotenv/config";
+import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
-import { PrismaClient } from "@prisma/czlient";
+import { clerkMiddleware, getAuth } from "@clerk/express";
+import { PrismaClient } from "@prisma/client";
 
 // Initialize Prisma
 const prisma = new PrismaClient();
@@ -8,26 +10,47 @@ const prisma = new PrismaClient();
 const app = express();
 const port = process.env.PORT || 4000;
 
-app.use(cors());
+app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:3000" }));
 app.use(express.json());
+app.use(clerkMiddleware());
 
-app.get("/health", (req, res) => {
+// ─── Auth middleware ──────────────────────────────────────────────────────────
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const { userId } = getAuth(req);
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+}
+
+// ─── Health ───────────────────────────────────────────────────────────────────
+app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "unified-streaming-hub-api" });
 });
 
-app.get("/api/watchlist", async (req, res) => {
+// ─── Ensure user exists in DB (called after Clerk auth) ──────────────────────
+async function ensureUser(userId: string, email?: string) {
+  await prisma.user.upsert({
+    where: { id: userId },
+    update: {},
+    create: {
+      id: userId,
+      email: email ?? `${userId}@clerk.user`,
+    },
+  });
+}
+
+// ─── Watchlist routes ─────────────────────────────────────────────────────────
+
+// GET /api/watchlist — fetch the signed-in user's watchlist
+app.get("/api/watchlist", requireAuth, async (req: Request, res: Response) => {
   try {
+    const { userId } = getAuth(req);
     const watchlist = await prisma.watchlistItem.findMany({
-      orderBy: { addedAt: "desc" }
+      where: { userId: userId! },
+      orderBy: { addedAt: "desc" },
     });
-
-    if (watchlist.length === 0) {
-      return res.json([
-        { id: "1", title: "Dune: Part Two", type: "Movie", progress: 0, image: "https://images.unsplash.com/photo-1534447677768-be436bb09401?q=80&w=800&auto=format&fit=crop", provider: "max", addedAt: new Date().toISOString() },
-        { id: "2", title: "Shogun", type: "Series", progress: 45, image: "https://images.unsplash.com/photo-1578589318433-39b511d5633f?q=80&w=800&auto=format&fit=crop", provider: "hulu", addedAt: new Date().toISOString() },
-      ]);
-    }
-
     res.json(watchlist);
   } catch (error) {
     console.error("Database error:", error);
@@ -35,29 +58,28 @@ app.get("/api/watchlist", async (req, res) => {
   }
 });
 
-app.post("/api/watchlist", async (req, res) => {
+// POST /api/watchlist — add an item
+app.post("/api/watchlist", requireAuth, async (req: Request, res: Response) => {
   try {
+    const { userId } = getAuth(req);
     const { title, type, image, provider } = req.body;
 
-    // In a real app, userId would come from Clerk tokens
-    const mockUserId = "user_123";
+    if (!title || !type || !provider) {
+      res.status(400).json({ error: "title, type, and provider are required" });
+      return;
+    }
 
-    // Create a mock user if it doesn't exist just to satisfy foreign key constraints for this demo
-    await prisma.user.upsert({
-      where: { id: mockUserId },
-      update: {},
-      create: { id: mockUserId, email: "demo@example.com" }
-    });
+    await ensureUser(userId!);
 
     const newItem = await prisma.watchlistItem.create({
       data: {
-        userId: mockUserId,
+        userId: userId!,
         title,
         type,
         image,
         provider,
         progress: 0,
-      }
+      },
     });
 
     res.status(201).json(newItem);
@@ -67,14 +89,23 @@ app.post("/api/watchlist", async (req, res) => {
   }
 });
 
-app.delete("/api/watchlist/:id", async (req, res) => {
+// DELETE /api/watchlist/:id — remove an item (only owner can delete)
+app.delete("/api/watchlist/:id", requireAuth, async (req: Request, res: Response) => {
   try {
+    const { userId } = getAuth(req);
     const { id } = req.params;
 
-    await prisma.watchlistItem.delete({
-      where: { id }
-    });
+    const item = await prisma.watchlistItem.findUnique({ where: { id } });
+    if (!item) {
+      res.status(404).json({ error: "Item not found" });
+      return;
+    }
+    if (item.userId !== userId) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
 
+    await prisma.watchlistItem.delete({ where: { id } });
     res.json({ success: true });
   } catch (error) {
     console.error("Database error:", error);
@@ -82,6 +113,53 @@ app.delete("/api/watchlist/:id", async (req, res) => {
   }
 });
 
+// ─── Provider preference routes ───────────────────────────────────────────────
+
+// GET /api/providers — fetch user's active providers
+app.get("/api/providers", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { userId } = getAuth(req);
+    const providers = await prisma.provider.findMany({
+      where: { userId: userId!, isActive: true },
+    });
+    res.json(providers);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to fetch providers" });
+  }
+});
+
+// POST /api/providers — save provider selections
+app.post("/api/providers", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { userId } = getAuth(req);
+    const { providers }: { providers: string[] } = req.body;
+
+    if (!Array.isArray(providers)) {
+      res.status(400).json({ error: "providers must be an array" });
+      return;
+    }
+
+    await ensureUser(userId!);
+
+    // Upsert each provider
+    const results = await Promise.all(
+      providers.map((p) =>
+        prisma.provider.upsert({
+          where: { userId_provider: { userId: userId!, provider: p } },
+          update: { isActive: true },
+          create: { userId: userId!, provider: p, isActive: true },
+        })
+      )
+    );
+
+    res.json(results);
+  } catch (error) {
+    console.error("Database error:", error);
+    res.status(500).json({ error: "Failed to save providers" });
+  }
+});
+
 app.listen(port, () => {
-  console.log(`🚀 API server is running on http://localhost:${port}`);
+  console.log(`🚀 API server running on http://localhost:${port}`);
 });
