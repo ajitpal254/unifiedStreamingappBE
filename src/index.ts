@@ -27,6 +27,21 @@ const PROVIDER_MAPPING: Record<string, number> = {
   "Discovery+": 445
 };
 
+type WatchmodeListTitle = {
+  tmdb_id: number;
+  type: "movie" | "tv";
+  title: string;
+  poster_path?: string | null;
+};
+
+type WatchmodeSource = {
+  name: string;
+  type: string;
+  web_url: string;
+  format: string;
+  price?: number | null;
+};
+
 app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:3000" }));
 app.use(express.json());
 app.use(clerkMiddleware());
@@ -119,7 +134,7 @@ app.get("/api/titles/recommended", requireAuth, async (req: Request, res: Respon
     const data = await response.json();
 
     // 4. Map to a clean format (Watchmode results differ from TMDB)
-    const results = data.titles.map((t: any) => ({
+    const results = data.titles.map((t: WatchmodeListTitle) => ({
       id: t.tmdb_id,
       media_type: t.type === "movie" ? "movie" : "tv",
       title: t.title,
@@ -132,6 +147,65 @@ app.get("/api/titles/recommended", requireAuth, async (req: Request, res: Respon
   } catch (error) {
     console.error("Recommendations error:", error);
     res.status(500).json({ error: "Failed to fetch recommendations" });
+  }
+});
+
+// GET /api/titles/personalized — recommendations based on watchlist
+app.get("/api/titles/personalized", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { userId } = getAuth(req);
+    
+    // 1. Get recent watchlist items (last 3)
+    const watchlist = await prisma.watchlistItem.findMany({
+      where: { userId: userId! },
+      orderBy: { addedAt: "desc" },
+      take: 3
+    });
+
+    if (watchlist.length === 0) {
+      return res.json({ results: [], reason: "No watchlist items" });
+    }
+
+    // 2. Fetch similar titles from TMDB for each watchlist item
+    const allRecommendations = await Promise.all(
+      watchlist.map(async (item) => {
+        try {
+          const type = item.tmdbType === "Series" ? "tv" : "movie";
+          const data = await tmdbFetch(`/${type}/${item.tmdbId}/similar`);
+          return (data.results || []).map((r: any) => ({
+            ...r,
+            media_type: r.media_type || (item.tmdbType === "Series" ? "tv" : "movie"),
+            basedOn: item.title
+          }));
+        } catch (e) {
+          return [];
+        }
+      })
+    );
+
+    // 3. Flatten, deduplicate, and filter out items already in watchlist
+    const watchlistIds = new Set(watchlist.map(i => i.tmdbId));
+    const flatResults = allRecommendations.flat();
+    
+    const uniqueResults = new Map();
+    flatResults.forEach(item => {
+      if (!watchlistIds.has(item.id) && !uniqueResults.has(item.id)) {
+        uniqueResults.set(item.id, item);
+      }
+    });
+
+    // 4. Return top 15 results
+    const results = Array.from(uniqueResults.values())
+      .sort((a, b) => b.popularity - a.popularity)
+      .slice(0, 15);
+
+    res.json({ 
+      results,
+      basedOn: watchlist[0].title // Primary reference for the UI
+    });
+  } catch (error) {
+    console.error("Personalized recommendations error:", error);
+    res.status(500).json({ error: "Failed to fetch personalized recommendations" });
   }
 });
 
@@ -213,13 +287,13 @@ app.get("/api/titles/:type/:id/availability", async (req: Request, res: Response
     const uniqueSources = new Map();
     
     // Sort sources: prioritize "sub" over "free", and specifically check for "Prime Video"
-    const sortedSources = sources.sort((a: any, b: any) => {
+    const sortedSources = (sources as WatchmodeSource[]).sort((a, b) => {
       if (a.name === "Prime Video") return -1;
       if (b.name === "Prime Video") return 1;
       return 0;
     });
 
-    sortedSources.forEach((s: any) => {
+    sortedSources.forEach((s) => {
       // Filter out generic Amazon store links if they are "buy/rent" 
       // but keep them if they are the only source
       if (["sub", "free"].includes(s.type)) {
@@ -291,25 +365,56 @@ app.get("/api/watchlist", requireAuth, async (req: Request, res: Response) => {
 app.post("/api/watchlist", requireAuth, async (req: Request, res: Response) => {
   try {
     const { userId } = getAuth(req);
-    const { title, type, image, provider, tmdbId } = req.body;
+    const { title, type, image, provider, tmdbId, tmdbType } = req.body;
 
-    if (!title || !type || !provider) {
-      res.status(400).json({ error: "title, type, and provider are required" });
+    if (!title || !type || !provider || !tmdbId || !tmdbType) {
+      res.status(400).json({ error: "title, type, provider, tmdbId, and tmdbType are required" });
+      return;
+    }
+
+    if (tmdbType !== "movie" && tmdbType !== "tv") {
+      res.status(400).json({ error: "tmdbType must be 'movie' or 'tv'" });
+      return;
+    }
+
+    const parsedTmdbId = Number(tmdbId);
+    if (!Number.isInteger(parsedTmdbId) || parsedTmdbId <= 0) {
+      res.status(400).json({ error: "tmdbId must be a positive integer" });
       return;
     }
 
     await ensureUser(userId!);
 
-    const newItem = await prisma.watchlistItem.create({
-      data: {
+    const existingItem = await prisma.watchlistItem.findFirst({
+      where: {
         userId: userId!,
-        title,
-        type,
-        image,
-        provider,
-        progress: 0,
+        tmdbType,
+        tmdbId: parsedTmdbId,
       },
     });
+
+    const newItem = existingItem
+      ? await prisma.watchlistItem.update({
+          where: { id: existingItem.id },
+          data: {
+            title,
+            type,
+            image,
+            provider,
+          },
+        })
+      : await prisma.watchlistItem.create({
+          data: {
+            userId: userId!,
+            title,
+            type,
+            tmdbId: parsedTmdbId,
+            tmdbType,
+            image,
+            provider,
+            progress: 0,
+          },
+        });
 
     res.status(201).json(newItem);
   } catch (error) {
@@ -367,8 +472,19 @@ app.post("/api/providers", requireAuth, async (req: Request, res: Response) => {
 
     await ensureUser(userId!);
 
+    const uniqueProviders = [...new Set(providers)];
+
+    await prisma.provider.updateMany({
+      where: {
+        userId: userId!,
+        provider: { notIn: uniqueProviders },
+        isActive: true,
+      },
+      data: { isActive: false },
+    });
+
     const results = await Promise.all(
-      providers.map((p) =>
+      uniqueProviders.map((p) =>
         prisma.provider.upsert({
           where: { userId_provider: { userId: userId!, provider: p } },
           update: { isActive: true },
@@ -381,6 +497,25 @@ app.post("/api/providers", requireAuth, async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Database error:", error);
     res.status(500).json({ error: "Failed to save providers" });
+  }
+});
+
+// ─── Tracking ────────────────────────────────────────────────────────────────
+app.post("/api/tracking/click", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { userId } = getAuth(req);
+    const { title, provider, url, tmdbId, tmdbType } = req.body;
+
+    // Log to console for now, but in a real app this would go to a Tracking table
+    console.log(`[CLICK_TRACKING] User ${userId} clicked ${provider} for "${title}" (${tmdbType}:${tmdbId}) -> ${url}`);
+    
+    // Optional: Save to DB if you have a Tracking model
+    // await prisma.clickTrack.create({ data: { userId, title, provider, url, tmdbId, tmdbType } });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Tracking error:", error);
+    res.status(500).json({ error: "Failed to track click" });
   }
 });
 

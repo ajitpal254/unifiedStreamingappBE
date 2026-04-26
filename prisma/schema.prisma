@@ -23,6 +23,8 @@ model WatchlistItem {
   userId    String
   title     String
   type      String   // Movie or Series
+  tmdbId    Int?
+  tmdbType  String?  // movie or tv
   progress  Int      @default(0) // 0-100
   image     String?
   provider  String
